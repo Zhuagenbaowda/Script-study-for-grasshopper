@@ -1,0 +1,185 @@
+// Grasshopper Script Instance
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+
+using System.Net.Http;
+using System.IO;
+using System.IO.Compression;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+    private void RunScript(
+	bool run,
+	double center_longitude,
+	double center_latitude,
+	double radius,
+	int zoom_level,
+	bool is_higher_DPI,
+	string pic_format,
+	string access_token,
+	string file_location,
+	ref object tiles_param)
+    {
+        if(run == false){//控制程序是否运行
+            return;
+        }
+
+        double min_log = new double();
+        double max_log = new double();
+        double min_lat = new double();
+        double max_lat=  new double();
+
+        GetLogAndLat(radius, center_longitude, center_latitude, zoom_level, out min_log, out max_log,out min_lat, out max_lat);//函数：按中心点经纬度和半径计算经纬度最大最小值
+
+        int xtile1 = LongitudeToXtile(min_log,zoom_level);//函数：最小经度Longitude对应的X值
+        int xtile2 = LongitudeToXtile(max_log,zoom_level);//函数：最大经度Longitude对应的X值
+        int ytile1 = LatitudeToYtile(min_lat,zoom_level);//函数：最小纬度Latitude对应的X值
+        int ytile2 = LatitudeToYtile(max_lat,zoom_level);//函数：最大纬度Latitude对应的X值
+
+        int min_xtile = Math.Min(xtile1, xtile2);//得到X的最小值
+        int max_xtile = Math.Max(xtile1, xtile2);//得到X的最大值
+        int min_ytile = Math.Min(ytile1, ytile2);//得到Y的最小值
+        int max_ytile = Math.Max(ytile1, ytile2);//得到Y的最大值
+
+        List<int[]> tiles_params = GetTilesParam(min_xtile, max_xtile,min_ytile, max_ytile,zoom_level);//函数：计算包含的瓦片参数int[]（Z,X,Y)
+        List<Bitmap> tiles_bitmap_list = Gettilespic(tiles_params, is_higher_DPI, pic_format, access_token);//下载数据并转换成bitmap
+        Bitmap bitmap_combine = combineBitmaps(tiles_bitmap_list, tiles_params, min_xtile, max_xtile,min_ytile, max_ytile);//函数：合并下载的瓦片图片
+
+        string output_pic_path = $"{file_location}\\mapbox_image.{pic_format}";//生成保存地址
+
+        System.Drawing.Imaging.ImageFormat imageFormat = null;
+        switch (pic_format){//根据输入得到图片格式
+            case "png":
+                imageFormat = System.Drawing.Imaging.ImageFormat.Png;
+                break;
+
+            case "jpeg":
+                imageFormat = System.Drawing.Imaging.ImageFormat.Jpeg;
+                break;
+        }
+
+        bitmap_combine.Save(output_pic_path, imageFormat);//保存图片
+
+        tiles_param = ListIntGroupToListString(tiles_params);//输出：函数：将list<int[]>转换为List<string>
+    }
+
+    public void GetLogAndLat(double length, double log_cen, double lat_cen, int zoom, out double min_log, out double max_log,out double min_lat, out double max_lat){//按中心点经纬度和半径计算经纬度最大最小值
+        double earth_radius = 6378137; // 地球半径（单位：米）
+        double rid_center_latitude = lat_cen * (Math.PI / 180); // 转换纬度为弧度
+        double rid_center_longitude = log_cen * (Math.PI / 180); // 转换经度为弧度
+
+        double radius_latitude = length / (earth_radius); // 纬度方向的半径弧度
+        double rid_lat_change = Math.Sqrt(Math.Pow(2, radius_latitude) - (Math.Pow(2, radius_latitude) * Math.Cos(radius_latitude) * Math.Cos(radius_latitude)));
+        double min_rid_lat = rid_center_latitude - rid_lat_change;
+        double max_rid_lat = rid_center_latitude + rid_lat_change;
+
+        double rid_log_change = length / (Math.Cos(rid_center_latitude) * earth_radius);
+        double min_rid_log = rid_center_longitude - rid_log_change;
+        double max_rid_log = rid_center_longitude + rid_log_change;
+
+        min_lat = Math.Min(min_rid_lat, max_rid_lat) * (180 / Math.PI);
+        max_lat = Math.Max(min_rid_lat, max_rid_lat) * (180 / Math.PI);
+        min_log = Math.Min(min_rid_log, max_rid_log) * (180 / Math.PI);// 转换为正值经度
+        max_log = Math.Max(min_rid_log, max_rid_log) * (180 / Math.PI);
+    }
+
+    public int LongitudeToXtile(double longitude,int zoom_level){//用经度Longitude与zoom计算瓦片X值
+        int x_tile;
+        double scale = Math.Pow(2, zoom_level);
+        double x_tem = (longitude + 180) / 360 * scale;
+        x_tile = (int)Math.Floor(x_tem);
+        return x_tile;
+    }
+
+    public int LatitudeToYtile(double latitude,int zoom_level){//用纬度Latitude与zoom计算瓦片Y值
+        int y_tile;
+        double scale = Math.Pow(2, zoom_level);
+        double sin_latitude = Math.Sin(latitude * Math.PI / 180);
+        double y_tem = (0.5 - Math.Log((1 + sin_latitude) / (1 - sin_latitude)) / (4 * Math.PI)) * scale;
+        y_tile = (int)Math.Floor(y_tem);
+        return y_tile;
+    }
+
+    public List<int[]> GetTilesParam(int min_x, int max_x,int min_y, int max_y,int zoom){//计算包含的瓦片参数int[]（Z,X,Y)   
+        List<int> xtiles = Enumerable.Range(min_x, max_x - min_x + 1).ToList();
+        List<int> ytiles = Enumerable.Range(min_y, max_y - min_y + 1).ToList();
+
+        List<int[]> xy_tiles = new List<int[]>();   
+     
+        for(int i = 0; i < xtiles.Count; i++)
+        {
+            for(int j = 0; j < ytiles.Count; j++)
+            {    
+                int[] xy_tile = new int[3];
+                xy_tile[0] = zoom;
+                xy_tile[1] = xtiles[i];
+                xy_tile[2] = ytiles[j];
+                xy_tiles.Add(xy_tile);
+            }
+        }
+
+        return xy_tiles;
+    }
+
+    public List<string> ListIntGroupToListString(List<int[]> list_intgroup){// 将list<int[]>转换为List<string>
+            List<string> tiles_params = new List<string>();
+
+            for(int i = 0; i < list_intgroup.Count; i++){
+                int[] int_group = list_intgroup[i];
+                string tile_param = $"{list_intgroup[i][0]}/{list_intgroup[i][1]}/{list_intgroup[i][2]}";
+                tiles_params.Add(tile_param);
+            }
+
+            return tiles_params;
+    }
+
+    public List<Bitmap> Gettilespic(List<int[]> tiles_params, bool is_higher_DPI, string pic_format, string access_token){// 用tiles的参数List<int[]>转换成API接口请求，下载图片数据，并转换成bitmap格式
+            List<Bitmap> tiles_bitmaps = new List<Bitmap>();
+
+            for(int i = 0; i < tiles_params.Count; i++){
+                string API_url = $"https://api.mapbox.com/v4/mapbox.satellite/{tiles_params[i][0]}/{tiles_params[i][1]}/{tiles_params[i][2]}{(is_higher_DPI ? "@2x" : "")}.{pic_format}?access_token={access_token}";//生成mapbox API接口链接
+
+                HttpClient client = new HttpClient();
+                HttpResponseMessage response = client.GetAsync(API_url).Result;
+                response.EnsureSuccessStatusCode(); 
+                byte[] imageData = response.Content.ReadAsByteArrayAsync().Result;
+
+                MemoryStream ms = new MemoryStream(imageData);
+                Bitmap bitmap_tile = (Bitmap)Image.FromStream(ms);
+                tiles_bitmaps.Add(bitmap_tile);
+            }
+
+            return tiles_bitmaps;
+    }
+
+    public Bitmap combineBitmaps(List<Bitmap> tiles_bitmap_list, List<int[]> tiles_params, int min_x, int max_x,int min_y, int max_y){//合并下载的瓦片图片
+        int width_single = tiles_bitmap_list[0].Width;//单个bitmap的宽度
+        int height_single = tiles_bitmap_list[0].Height;//单个bitmap的高度
+        int width_num = max_x - min_x + 1;//bitmap在宽度上的数量
+        int height_num = max_y - min_y + 1;//bitmap在高度上的数量
+
+        Bitmap bitmap_merged = new Bitmap(width_single * width_num, height_single * height_num);//生成新的bitmap
+        Graphics graphics = Graphics.FromImage(bitmap_merged);// 创建一个 Graphics 对象，用于绘制到新的 Bitmap 上
+
+        for(int i = 0; i < tiles_bitmap_list.Count; i++){
+            int point_x = (tiles_params[i][1] - min_x) * width_single;//X的坐标（最左上为（0，0）
+            int point_y = (tiles_params[i][2] - min_y) * height_single;//Y的坐标（最左上为（0，0）
+            graphics.DrawImage(tiles_bitmap_list[i], new System.Drawing.Point(point_x, point_y));
+        }
+
+        return bitmap_merged;
+    }
+}
