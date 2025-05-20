@@ -1,0 +1,339 @@
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+
+#r "C:\Users\Administrator\Desktop\script study\nuget\packages\mapbox.vectortile.1.0.4-alpha2\lib\uap10\Mapbox.VectorTile.VectorTileReader.dll"
+#r "C:\Users\Administrator\Desktop\script study\nuget\packages\mapbox.vectortile.1.0.4-alpha2\lib\uap10\Mapbox.VectorTile.ExtensionMethods.dll"
+#r "C:\Users\Administrator\Desktop\script study\nuget\packages\mapbox.vectortile.1.0.4-alpha2\lib\uap10\Mapbox.VectorTile.Geometry.dll"
+//grasshopper开VPN无法从nuget下载，必须本地
+
+using System.Net.Http;
+using System.Threading.Tasks;
+using Mapbox.VectorTile;
+using Mapbox.VectorTile.Geometry;
+using System.IO;
+using System.IO.Compression;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+    private void RunScript(
+	bool run,
+	double center_longitude,
+	double center_latitude,
+	double radius,
+	int zoom_level,
+	bool real_size_with_latitude,
+	string access_token,
+	ref object contours,
+	ref object mvt_frame,
+	ref object mvts_para)
+    {
+        if(run == false){//控制程序是否运行
+            return;
+        }
+
+        if(zoom_level < 9){//当zoom过小，不输出并给出原因
+            mvts_para = "zoom小于9,无等高线数据";
+            return;
+        }
+
+        if(zoom_level > 16){//当zoom过大，不输出并给出原因
+            mvts_para = "zoom大于16,等高线数据精度没这么高,且单块MVT范围过小";
+            return;
+        }
+
+        double min_log1 = new double();
+        double max_log1 = new double();
+        double min_lat1 = new double();
+        double max_lat1=  new double();
+
+        GetLogandLat(radius, center_longitude, center_latitude, zoom_level, out min_log1, out max_log1,out min_lat1, out max_lat1);//函数：按中心点经纬度和半径计算经纬度最大最小值
+
+        int xtile1 = Longitude2Xtile(min_log1,zoom_level);//函数：最小经度Longitude对应的X值
+        int xtile2 = Longitude2Xtile(max_log1,zoom_level);//函数：最大经度Longitude对应的X值
+        int ytile1 = Latitude2Ytile(min_lat1,zoom_level);//函数：最小纬度Latitude对应的X值
+        int ytile2 = Latitude2Ytile(max_lat1,zoom_level);//函数：最大纬度Latitude对应的X值
+
+        int min_xtile = Math.Min(xtile1, xtile2);//得到X的最小值
+        int max_xtile = Math.Max(xtile1, xtile2);//得到X的最大值
+        int min_ytile = Math.Min(ytile1, ytile2);//得到Y的最小值
+        int max_ytile = Math.Max(ytile1, ytile2);//得到Y的最大值
+
+        List<int[]> mvt_tiles_para = GetXYtiles(min_xtile, max_xtile,min_ytile, max_ytile,zoom_level);//函数：计算包含的瓦片参数int[]（Z,X,Y)
+        mvts_para = ListIntGroup2TreeInt(mvt_tiles_para); //输出：函数：将list<int[]>转换为Tree<int>
+
+        List<VectorTile> mvt_files = new List<VectorTile>();
+
+        for(int i = 0; i < mvt_tiles_para.Count; i++){//通过Mapbox API下载bytes[],并转换为mvt格式
+            byte[] mvt_unzip_byte = DownloadMvtFile( mvt_tiles_para[i],access_token);//函数：生成mapbox API接口链接，通过API下载mvt文件的未解压byte[]
+            byte[] mvt_bytes = DecompressGZip(mvt_unzip_byte); // 函数：解压byte[]
+            VectorTile mvts_file = new VectorTile(mvt_bytes);//依赖:将被解压的byte[]转换为mvt格式
+            mvt_files.Add(mvts_file);
+        }
+
+        List<List<Curve>> mvts_contours_noedge = new List<List<Curve>>();
+
+        for(int i = 0; i < mvt_files.Count; i++){//将每个mvt文件转换为extent（0-4096）内的等高线List<List<Curve>>
+            List<Curve> mvt_contours = Contour4mvt(mvt_files[i]);//函数：根据mvt生成已去除frame的等高线List<Curve>
+            mvts_contours_noedge.Add(mvt_contours);
+        }
+
+        List<List<Curve>> contour_transed = ListListCurves2Transform (mvts_contours_noedge, mvt_tiles_para, zoom_level, min_xtile, max_ytile, real_size_with_latitude, center_latitude);//函数：将contours变形移动到真实大小和位置
+        contours = ListCurve2TreeCurve(contour_transed);//输出：函数：将list<List<Curve>>转为Tree<Curve>
+
+        List<List<Curve>> mvts_info_frame = new List<List<Curve>>();
+
+        for(int i = 0; i < mvt_tiles_para.Count; i++ ){//用MVT瓦片的参数生成带XYZ数据的Frame线框List<List<Curve>>
+            List<Curve> mvt_frame_curves = Frame4Mvt(mvt_tiles_para[i]);//函数：生成某个mvt的带参数外框List<Curve>
+            mvts_info_frame.Add(mvt_frame_curves);
+        }
+        
+        List<List<Curve>> mvts_frame_transed = ListListCurves2Transform (mvts_info_frame, mvt_tiles_para, zoom_level, min_xtile, max_ytile, real_size_with_latitude, center_latitude);//函数：将mvt的frames变形移动到真实大小和位置
+        mvt_frame = ListCurve2TreeCurve(mvts_frame_transed);//输出：函数：将list<List<Curve>>转为Tree<Curve>
+    }
+
+
+    public void GetLogandLat(double length, double log_cen, double lat_cen, int zoom, out double min_log, out double max_log,out double min_lat, out double max_lat){//按中心点经纬度和半径计算经纬度最大最小值
+        double earth_radius = 6378137; // 地球半径（单位：米）
+        double rid_center_latitude = lat_cen * (Math.PI / 180); // 转换纬度为弧度
+        double rid_center_longitude = log_cen * (Math.PI / 180); // 转换经度为弧度
+
+        double radius_latitude = length / (earth_radius); // 纬度方向的半径弧度
+        double rid_lat_change = Math.Sqrt(Math.Pow(2, radius_latitude) - (Math.Pow(2, radius_latitude) * Math.Cos(radius_latitude) * Math.Cos(radius_latitude)));
+        double min_rid_lat = rid_center_latitude - rid_lat_change;
+        double max_rid_lat = rid_center_latitude + rid_lat_change;
+
+        double rid_log_change = length / (Math.Cos(rid_center_latitude) * earth_radius);
+        double min_rid_log = rid_center_longitude - rid_log_change;
+        double max_rid_log = rid_center_longitude + rid_log_change;
+
+        min_lat = Math.Min(min_rid_lat, max_rid_lat) * (180 / Math.PI);
+        max_lat = Math.Max(min_rid_lat, max_rid_lat) * (180 / Math.PI);
+        min_log = Math.Min(min_rid_log, max_rid_log) * (180 / Math.PI);// 转换为正值经度
+        max_log = Math.Max(min_rid_log, max_rid_log) * (180 / Math.PI);
+    }
+
+    public int Longitude2Xtile(double longitude,int zoom_level){//用经度Longitude与zoom计算瓦片X值
+        int x_tile;
+        double scale = Math.Pow(2, zoom_level);
+        double x_tem = (longitude + 180) / 360 * scale;
+        x_tile = (int)Math.Floor(x_tem);
+        return x_tile;
+    }
+
+    public int Latitude2Ytile(double latitude,int zoom_level){//用纬度Latitude与zoom计算瓦片Y值
+        int y_tile;
+        double scale = Math.Pow(2, zoom_level);
+        double sin_latitude = Math.Sin(latitude * Math.PI / 180);
+        double y_tem = (0.5 - Math.Log((1 + sin_latitude) / (1 - sin_latitude)) / (4 * Math.PI)) * scale;
+        y_tile = (int)Math.Floor(y_tem);
+        return y_tile;
+    }
+
+    public List<int[]> GetXYtiles(int min_x, int max_x,int min_y, int max_y,int zoom){//计算包含的瓦片参数int[]（X,Y,Z)   
+        List<int> xtiles = Enumerable.Range(min_x, max_x - min_x + 1).ToList();
+        List<int> ytiles = Enumerable.Range(min_y, max_y - min_y + 1).ToList();
+
+        List<int[]> xy_tiles = new List<int[]>();   
+     
+        for(int i = 0; i < xtiles.Count; i++)
+        {
+            for(int j = 0; j < ytiles.Count; j++)
+            {    
+                int[] xy_tile = new int[3];
+                xy_tile[0] = zoom;
+                xy_tile[1] = xtiles[i];
+                xy_tile[2] = ytiles[j];
+                xy_tiles.Add(xy_tile);
+            }
+        }
+
+        return xy_tiles;
+    }
+
+    public byte[] DownloadMvtFile(int[] mvt_tile_para, string access_token1){ //生成mapbox API接口链接，通过API下载mvt文件的未解压byte[]
+        string API_url = string.Format("https://api.mapbox.com/v4/mapbox.mapbox-terrain-v2/{0}/{1}/{2}.vector.pbf?access_token={3}", mvt_tile_para[0], mvt_tile_para[1], mvt_tile_para[2], access_token1); //生成mapbox API接口链接
+        
+        HttpClient client = new HttpClient();//下载mvt数据,格式为未解压byte[]
+        HttpResponseMessage response = client.GetAsync(API_url).Result;
+        response.EnsureSuccessStatusCode(); 
+        return response.Content.ReadAsByteArrayAsync().Result;
+    }
+
+    public byte[] DecompressGZip(byte[] compressedData){// 解压byte[]
+        using (var compressedStream = new MemoryStream(compressedData))
+        using (var decompressionStream = new GZipStream(compressedStream, CompressionMode.Decompress))
+        using (var resultStream = new MemoryStream())
+        {
+             decompressionStream.CopyTo(resultStream);
+             return resultStream.ToArray();
+        }
+    }
+
+    public PolylineCurve GetExtentFrame(double height_contour){ // 根据高度生成mvt的实际范围    
+        Vector3d vec1_plane = new Vector3d(0,0,1);
+        Point3d op_plane = new Point3d(0,0,height_contour);
+        Plane plane_thisheight = new Plane(op_plane,vec1_plane);
+        Rectangle3d rec_thiscontour= new Rectangle3d(plane_thisheight,4096,-4096);
+        Polyline polyline_thiscontour = rec_thiscontour.ToPolyline();
+        PolylineCurve frame_thiscontour = polyline_thiscontour.ToPolylineCurve();
+        return frame_thiscontour;
+    }
+
+    public List<Curve> Contour4mvt(VectorTile mvt_file){ // 根据mvt生成等高线List<Curve> 
+        List<Curve> mvt_contours_noframe = new List<Curve>();
+        List<double> this_feature_heights = new List<double>();
+        VectorTileLayer mvt_layer_contour = mvt_file.GetLayer("contour"); //获取等高线图层
+
+        for(int i = 0;i < mvt_layer_contour.FeatureCount(); i++){//生成每个mvt的所有等高线（超过了extent：0-4096）
+            double layer_height = Convert.ToDouble(mvt_layer_contour.GetFeature(i).GetValue("ele")); //获取这个Feature的高度(int64转换为double)
+            List<List<Point2d<int>>> list_point2d_thisfeature = mvt_layer_contour.GetFeature(i).Geometry<int>();//获取这个contour的高度的所有point2d的List(每个feature内可能有一个以上的等高线，所以是list<list>)
+         
+            foreach(List<Point2d<int>> list_point2d in list_point2d_thisfeature){//用List<point2d>求得extent内的等高线
+                List<Point3d> contour_point3ds = new List<Point3d>();
+
+                foreach(Point2d<int> vts_point2d in list_point2d){//用point2d和这个feature的ele生成point3d                
+                    double vts_point3d_x = vts_point2d.X;
+                    double vts_point3d_y = - vts_point2d.Y;
+                    double vts_point3d_z = layer_height;
+                    Point3d contour_point3d = new Point3d(vts_point3d_x, vts_point3d_y, vts_point3d_z);
+                    contour_point3ds.Add(contour_point3d);
+                }
+
+                PolylineCurve contour_outextent = new PolylineCurve(contour_point3ds);//用point3d生成polylinecurve,可能超出extent(0-4096)
+                PolylineCurve contour_frame_thisheight = GetExtentFrame(layer_height);//函数：生成这个contour高度的extent
+                double tolerance_doc = this.RhinoDocument.ModelAbsoluteTolerance;//获取默认tolerance值
+                Curve[] contour2inextent = Rhino.Geometry.Curve.CreateBooleanIntersection(contour_outextent,contour_frame_thisheight,tolerance_doc);//得到extent内的contour(依然有frame)
+                List<Curve> list_contour_inextent = contour2inextent.Cast<Curve>().ToList();//将Curve[]转换成List<Curve>
+                List<Curve> list_contour_noframe = new List<Curve>();
+
+                for(int j = 0; j < list_contour_inextent.Count; j++){//去掉contour的frame
+                   Curve coutour_withinextent = list_contour_inextent[j];
+                   Curve[] contourlines_withinextent = coutour_withinextent.DuplicateSegments();//取出curve(polylinecurve)的每一个段
+                   List<Curve> single_curve_within = new List<Curve>();
+
+                   foreach(Curve contourline in contourlines_withinextent){//判断每个contour的每个线段是否是frame的一部分，如果不是则加入新List
+                       Double middle_length = contourline.GetLength() / 2;
+                       Point3d middlepoint_contourline = contourline.PointAtLength(middle_length);//求得contour线段的中点
+                       Double point2frame_t = new Double();
+                       contour_frame_thisheight.ClosestPoint(middlepoint_contourline, out point2frame_t);//求得frame到contour线段中点的最近点的t值
+                       Point3d cloestpoint_frame = contour_frame_thisheight.PointAt(point2frame_t);//求得这个最近点
+                       Double distance2frame = cloestpoint_frame.DistanceTo(middlepoint_contourline);
+
+                       if(distance2frame > tolerance_doc * 3){//如果距离大于本模型误差值的3倍，就认为不在frame上
+                           single_curve_within.Add(contourline);
+                       }    
+                   }
+
+                    list_contour_noframe.Add(coutour_withinextent);
+                    mvt_contours_noframe.AddRange(single_curve_within);//将这个原始等高线生成的List<Curve>增加到要输出的List<Curve>
+                }
+            }
+        } 
+
+        return mvt_contours_noframe;
+    } 
+
+    public DataTree<int> ListIntGroup2TreeInt(List<int[]> list_intgroup){// 将list<int[]>转换为Tree<int>
+        DataTree<int> int_tree_trs = new DataTree<int>();
+        int path_index = 0;
+        for(int i = 0; i < list_intgroup.Count; i++){
+            int[] int_group = list_intgroup[i];
+            List<int> list_int = new List<int>();
+            GH_Path path = new GH_Path(path_index);
+            path_index++;
+            
+            foreach(int j in int_group){
+                list_int.Add(j);
+            }
+
+            int_tree_trs.AddRange(list_int,path);
+        }
+
+        return int_tree_trs;
+    }
+
+    public DataTree<Curve> ListCurve2TreeCurve(List<List<Curve>> list_list_curve){// 将list<List<Curve>转换为Tree<Curve>
+        DataTree<Curve> tree_curve = new DataTree<Curve>();
+        int path_index = 0;
+
+        for(int i = 0; i < list_list_curve.Count; i++){
+            List<Curve> list_curve = list_list_curve[i];
+            GH_Path path = new GH_Path(path_index);
+            path_index++;
+            tree_curve.AddRange(list_curve,path);
+        }
+
+            return tree_curve;
+    }
+
+    public List<List<Curve>> ListListCurves2Transform (List<List<Curve>> list_list_curves2trans, List<int[]> mvts_para, double zoom, int min_x, int max_y,bool real_size_with_latitude,double center_latitude){// 将list<List<Curve>变形移动到真实大小和位置
+       List<List<Curve>> list_list_curves_transed = new List<List<Curve>>();
+
+       double earth_radius = 6378137; // 地球半径（单位：米）
+       double frame_realsize = new double();
+
+       if(real_size_with_latitude == true){// true：根据纬度计算此纬度地球周长，再计算瓦片大小
+        frame_realsize = (earth_radius * Math.PI * 2 * Math.Cos(center_latitude * (Math.PI / 180))) / Math.Pow(2, zoom);
+       }
+       else{//flase：直接用赤道长度计算瓦片大小
+        frame_realsize = (earth_radius * Math.PI * 2) / Math.Pow(2, zoom);
+       }
+       
+       double size_para = frame_realsize / 4096 ;//每个mvt的大小变形系数
+       Transform scale_tf = Rhino.Geometry.Transform.Scale(Plane.WorldXY,size_para,size_para, 1);//所有mvt的共同大小变形
+
+       for(int i = 0; i < list_list_curves2trans.Count; i++){//将每个mvt移动到对应位置
+            List<Curve> list_curves2trans = list_list_curves2trans[i];
+
+            int x_para = mvts_para[i][1];
+            int y_para = mvts_para[i][2];
+            double x_move = 4096 * (x_para - min_x);
+            double y_move = 4096 * (max_y - y_para + 1);
+            Point3d Op = new Point3d(0,0,0);
+            Vector3d dp = new Vector3d(x_move,y_move,0);
+            Transform move_tf = Rhino.Geometry.Transform.Translation(dp);//每个mvt的单独移动变形
+            
+            List<Curve> list_curves_transed = new List<Curve>();
+
+            for(int j = 0; j < list_curves2trans.Count; j++){
+                Curve curve2move = list_curves2trans[j];
+                Curve curve_transed = curve2move.DuplicateCurve();
+                curve_transed.Transform(move_tf);
+                curve_transed.Transform(scale_tf);
+                list_curves_transed.Add(curve_transed);
+            }
+
+            list_list_curves_transed.Add(list_curves_transed);
+       }
+
+       return list_list_curves_transed;
+    }
+
+    public List<Curve> Frame4Mvt(int[] mvt_para){// 生成某个mvt的带参数外框List<Curve>
+        int Z_tile = mvt_para[0];
+        int X_tile = mvt_para[1];
+        int Y_tile = mvt_para[2];
+        string mvt_para_string = String.Format("{0} / {1} / {2}", Z_tile, X_tile, Y_tile);
+        var font = "Arial";//生成的参数的字体
+        Plane mvt_para_plane = new Plane(new Point3d(300,-300,0), new Vector3d(1,0,0), new Vector3d(0,1,0));//生成的参数的位置
+        Curve[] mvt_para_curvesg = Curve.CreateTextOutlines(mvt_para_string, font, 100, 0, true, mvt_para_plane, 1.0, 0.01);//生成参数的曲线
+        List<Curve> mvt_frame = mvt_para_curvesg.ToList();
+        Curve frame0 = GetExtentFrame(0);//函数：生成mvt的实际范围（高度为0）
+        mvt_frame.Add(frame0);
+        return mvt_frame;
+    }
+
+}
