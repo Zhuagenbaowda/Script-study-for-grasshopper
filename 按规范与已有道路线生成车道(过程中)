@@ -1,0 +1,139 @@
+//计划：
+1.class内不要有method
+2.一层method根据宽度与选择决定生成策略
+3.一层method生成平面线
+4.一层method投影并生成mesh
+//
+
+// Grasshopper Script Instance
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+    private void RunScript(
+	Curve Curve1,
+	Curve Curve2,
+	Brep RoadSurface,
+	bool Oneway,
+	string WaitingArea,
+	string ZebraCrossing,
+	string GreenSeparation,
+	string BikeWay,
+	ref object WhiteLine,
+	ref object YellowLine,
+	ref object GreenLand,
+	ref object Parterre,
+	ref object a){
+        Mesh[] Road_Mesh_Array = Rhino.Geometry.Mesh.CreateFromBrep(RoadSurface,Rhino.Geometry.MeshingParameters.QualityRenderMesh);//生成道路面mesh
+        //double t_absolute = this.RhinoDocument.ModelAbsoluteTolerance;
+        //double t_angle_degrees = this.RhinoDocument.ModelAngleToleranceDegrees;
+        //double t_angle_radians = this.RhinoDocument.ModelAngleToleranceRadians;
+        
+        Curve curve1_plan = Rhino.Geometry.Curve.ProjectToPlane(Curve1, Plane.WorldXY);//Curve1的平面线
+        Curve curve2_plan = Rhino.Geometry.Curve.ProjectToPlane(Curve2, Plane.WorldXY);//Curve2的平面线
+        //市政道路最大坡度8%，cos值极小。故默认道路曲面与其平面投影上的形状变化忽略不计
+
+        double start_to_start = curve1_plan.PointAtStart.DistanceTo(curve2_plan.PointAtStart);
+        double start_to_end = curve1_plan.PointAtStart.DistanceTo(curve2_plan.PointAtEnd);
+        if(start_to_start > start_to_end){//判断Curve1和Curve2的方向是否相同，不相同则反转curve2
+            curve2_plan.Reverse();
+        }
+
+        Point3d cpoint_curve1 = new Point3d();
+        Point3d cpoint_curve2 = new Point3d();
+        Curve1.ClosestPoints(Curve2, out cpoint_curve1, out cpoint_curve2);
+        double road_wide = cpoint_curve1.DistanceTo(cpoint_curve2);//道路在空间上的宽度double
+
+        RoadIdentification RI_test1 = new RoadIdentification(Plane.WorldXY,"111");
+        Mesh RI_mesh_test = RI_test1.CRI(Road_Mesh_Array,this.RhinoDocument);
+        a = RI_mesh_test;
+    }
+
+    public class TrafficLine{//定义CLASS :交通标识线;  包含属性：中线Curve MiddleCurve & 标线类型string LineType; 待写方法一个
+        
+        public Curve MiddleCurve {get; set;}
+        public string LineType {get; set;}
+
+        public TrafficLine(Curve curve, string type){
+            MiddleCurve = curve;
+            LineType = type;
+        }
+
+        //public void GeneratingLine (){}   待生成的方法：直接生成标线的mesh（调用？）
+    }
+
+    public class GreenSeparation{//定义CLASS :绿化分隔;  包含属性：中线Curve MiddleCurve & 绿化宽度double GreenWide; 待写方法一个
+        
+        public Curve MiddleCurve {get; set;}
+        public double GreenWide {get; set;}
+
+        public GreenSeparation(Curve curve, double wide){
+            MiddleCurve = curve;
+            GreenWide = wide;
+        }
+
+        //public void GeneratingGreenSeparation (){}   待生成的方法：直接生成绿化的mesh（调用？）
+    }
+
+    public class RoadIdentification{//定义CLASS :路面标识;  包含属性：平面IdentificationPlan & 标识类型string IdentificationType;
+        
+        public Plane IdentificationPlan {get; set;}
+        public string IdentificationType {get; set;}
+
+        public RoadIdentification(Plane plane, string type){
+            IdentificationPlan = plane;
+            IdentificationType = type;
+        }
+
+        public Mesh CRI(Mesh[] mesh_array, RhinoDoc document){
+            Mesh mesh_road = Creating_RI_ZhiXing(IdentificationPlan, mesh_array, document);
+            return mesh_road;
+        }
+    }
+
+    public static Mesh Creating_RI_ZhiXing(Plane plane1, Mesh[] mesh_array, RhinoDoc document){// 生成直行标识的方法
+        List<Point3d> points = new List<Point3d>();
+        points.Add(new Point3d(0,3,0));
+        points.Add(new Point3d(0.45,0.6,0));
+        points.Add(new Point3d(0.15,0.6,0));
+        points.Add(new Point3d(0.15,-3,0));
+        points.Add(new Point3d(-0.15,-3,0));
+        points.Add(new Point3d(-0.15,0.6,0));
+        points.Add(new Point3d(-0.45,0.6,0));
+        points.Add(new Point3d(0,3,0));
+        PolylineCurve polylinecurve_plan1 = new PolylineCurve(points);
+        Curve curve_plan1 = polylinecurve_plan1.ToNurbsCurve();
+        curve_plan1.Transform(Rhino.Geometry.Transform.PlaneToPlane(Plane.WorldXY, plane1));
+
+        Curve[] curve_project_array = Rhino.Geometry.Curve.ProjectToMesh(curve_plan1, mesh_array, Vector3d.ZAxis, document.ModelAbsoluteTolerance);
+        Curve[] curve_array_tmp = Rhino.Geometry.Curve.JoinCurves(curve_project_array);
+
+        Mesh mesh_RI = new Mesh();
+        for(int i = 0; i < curve_array_tmp.Length; i++){
+            Polyline polyline_tmp = new Polyline();
+            curve_array_tmp[i].TryGetPolyline(out polyline_tmp);
+            //也可以用curve.GrevillePoints()这个方法获得控制点再生成polyline
+
+            if(polyline_tmp != null){
+                Mesh mesh_tep = Rhino.Geometry.Mesh.CreatePatch(polyline_tmp, document.ModelAngleToleranceRadians, null, null, null, null, true, 0);
+                mesh_RI.Append(mesh_tep);
+            }
+        }
+
+        return mesh_RI;
+    }
+}
