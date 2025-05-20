@@ -1,0 +1,180 @@
+// Grasshopper Script Instance
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+    private void RunScript(
+	bool Run,
+	Mesh Mesh,
+	Vector3d Direction,
+	double Length,
+	bool Keep_Edge,
+	bool is_Quad,
+	ref object New_Mesh)
+    {
+        if(Run == false){//控制是否运行
+            return;
+        }
+
+        Plane o_mesh_plane = Plane.WorldXY;
+        double vector_angle = Vector3d.VectorAngle(Direction, Plane.WorldXY.XAxis, Plane.WorldXY);//测量给定轴与WorldX的角度
+        
+        if(vector_angle != RhinoMath.UnsetValue)//如果结果不是RhinoMath.UnsetValue，则判断为有角度，并旋转
+            o_mesh_plane.Rotate(vector_angle, Plane.WorldXY.ZAxis);
+
+        Box box_o_mesh = new Box();
+        BoundingBox boundingbox1 = Mesh.GetBoundingBox(o_mesh_plane, out box_o_mesh);
+        Point3d center_o_mesh = box_o_mesh.PointAt(0.5,0.5,0);//原始mesh的世界box的中心点
+        Point3d corner1_o_mesh = box_o_mesh.PointAt(1.1,0.5,0);//原始mesh的世界box的X轴端点
+        Point3d corner2_o_mesh = box_o_mesh.PointAt(0.5,1.1,0);//原始mesh的世界box的Y轴端点
+
+        Mesh mesh_xf = Mesh.DuplicateMesh();//将原始mesh复制一个副本
+        Transform to_worldxy = Transform.PlaneToPlane(new Plane(center_o_mesh, corner1_o_mesh, corner2_o_mesh), Plane.WorldXY);//移动到WorldXY的变形量
+        mesh_xf.Transform(to_worldxy);//将原始mesh的副本转移到世界原点
+
+        BoundingBox boundingbox2 = Mesh.GetBoundingBox(false);
+        Point3d corner1 = boundingbox2.PointAt(0.5,0.5,0);//box中心点
+        Point3d corner2 = boundingbox2.PointAt(1.1,0.5,0);//box的X轴端点
+        Point3d corner3 = boundingbox2.PointAt(0.5,1.1,0);//box的Y轴端点
+        int number_x = (int) Math.Ceiling(new Line(corner1,corner2).Length / Length);//X方向有多少段
+        int number_y = (int) Math.Ceiling(new Line(corner1,corner3).Length / Length);//Y方向有多少段
+
+        List<Point3d> plane_points1 = new List<Point3d>();
+        for(int i = -number_x; i < number_x+1; i++){//所有的平面矩阵点
+            for (int j = -number_y; j < number_y+1; j++){
+                plane_points1.Add(new Point3d(i * Length, j * Length, 0));
+            }
+        }
+
+        Polyline mesh_outline = new Polyline();
+        if(Keep_Edge == true){//Keep_Edge为true，得到mesh的原始outline
+            mesh_outline = mesh_xf.GetNakedEdges()[0];
+        }
+        else{//Keep_Edge为false，算出跟随矩阵变形的outline
+            List<Plane> itc_planes = new List<Plane>();
+            
+            Curve line_itc_1 = new Line(plane_points1[0],plane_points1[plane_points1.Count-number_y*2 -1]).ToNurbsCurve();//Y方向的切割Plane
+            for(int i = 0; i < number_x * 2; i++){
+                Plane plane_temp1 = new Plane();
+                line_itc_1.PerpendicularFrameAt((i * Length), out plane_temp1);
+                itc_planes.Add(plane_temp1);
+            }
+
+            Curve line_itc_2 = new Line(plane_points1[0],plane_points1[number_y * 2]).ToNurbsCurve();//C方向的切割Plane
+            for(int j = 0; j < number_y * 2; j++){
+                Plane plane_temp2 = new Plane();
+                line_itc_2.PerpendicularFrameAt((j * Length), out plane_temp2);
+                itc_planes.Add(plane_temp2);
+            }
+
+            Curve mesh_outline0 = mesh_xf.GetNakedEdges()[0].ToNurbsCurve();//得到mesh的原始outline
+            List<NurbsCurve> t_mesh_outline0 = Rhino.Geometry.Intersect.Intersection.MeshPlane(mesh_xf, itc_planes).Select(c => c.ToNurbsCurve()).ToList();//将Plane与mesh切割,得到切割线并转换
+            
+            List<double> t_list0 = new List<double>();
+            for(int i = 0; i < t_mesh_outline0.Count; i++){//取出每个切割线的端点在meshoutline上的T值
+                double t_temp = new double();
+                mesh_outline0.ClosestPoint(t_mesh_outline0[i].PointAtStart, out t_temp);
+                t_list0.Add(t_temp);
+                mesh_outline0.ClosestPoint(t_mesh_outline0[i].PointAtEnd, out t_temp);
+                t_list0.Add(t_temp);
+            }
+            t_list0.Sort();//t值大小排序
+            List<Point3d> mesh_outline_points = t_list0.Select(t =>  mesh_outline0.PointAt(t)).ToList();//t值排序，并转换成meshoutline上的点
+            mesh_outline_points.Add(mesh_outline_points[0]);//加上第一个点，保证生成的线能封闭
+            mesh_outline  = new Polyline(mesh_outline_points);
+        }
+
+        List<Mesh> meshlist1= new List<Mesh>();
+        meshlist1.Add(mesh_xf);
+        double t_doc = this.RhinoDocument.ModelAbsoluteTolerance;//获得模型的默认Tolerance
+        double tr_doc = this.RhinoDocument.ModelAngleToleranceRadians;//获得模型的默认ToleranceRadians
+        List<Point3d> points_on_mesh1= Rhino.Geometry.Intersect.Intersection.ProjectPointsToMeshes(meshlist1, plane_points1, new Vector3d(0,0,1), t_doc).ToList();//将点投影到mesh上
+        List<Point3d> points_on_mesh2= Point3d.CullDuplicates(points_on_mesh1, t_doc * 5).ToList();//去除重复点
+        Mesh mesh_rebuild0 = Mesh.CreatePatch(mesh_outline, tr_doc, null, null, null, points_on_mesh2, false, 0);//生成三角face的mesh
+        Mesh mesh_rebuild1 = FlipMeshToUp(mesh_rebuild0);//函数：将mesh的正面转到向上
+
+
+        if(is_Quad == true){//当is_Quad为true,将可以合并成完美正方形的三角面合并，再输出
+            Rhino.Geometry.Collections.MeshTopologyEdgeList edgeslist = mesh_rebuild1.TopologyEdges;//获取所有拓步边
+            Rhino.Geometry.Collections.MeshTopologyVertexList verticeslist = mesh_rebuild1.TopologyVertices;//获取所有拓步点
+            var mesh_faces = mesh_rebuild1.Faces;//获取所有face与其ID
+            List<int> face_ID = new List<int>();
+            Mesh quad_mesh = new Mesh();
+            Mesh quad_mesh1 = new Mesh();
+
+            for(int i = 0; i < edgeslist.Count; i++){//筛选出矩形斜边(理论平面最长边），再得到相邻face的ID（Rhino的point生成mesh的方法,不会生成一个直角等边三角型加2个小三角形的模式，因此不需要通过face的面积筛选是不是我们想要的face)
+                Line edge_i = edgeslist.EdgeLine(i);
+                Vector3d vector_i_plane = new Vector3d(edge_i.ToX - edge_i.FromX, edge_i.ToY - edge_i.FromY, 0);
+                double length_dif = Math.Abs(vector_i_plane.Length - Length * Math.Sqrt(2));//此边与理论矩形斜边的长度差
+
+                if(length_dif < t_doc){//如果长度差小于误差，则将这个边的相邻face的ID放入List
+                    int[] faceID_to_quad = edgeslist.GetConnectedFaces(i);
+                    face_ID.AddRange(faceID_to_quad.ToList());
+                }
+            }
+            
+            for(int i = 0; i < face_ID.Count; i = i +2){//得到生成的拥有 quad faces 的mesh
+                MeshFace meshface_first = mesh_faces[face_ID[i]];//第1个三角face
+                MeshFace meshface_second = mesh_faces[face_ID[i+1]];//第2个三角face
+
+                Point3f first_A = mesh_rebuild1.Vertices[meshface_first.A];//第1个三角face的A点
+                Point3f first_B = mesh_rebuild1.Vertices[meshface_first.B];//第1个三角face的B点
+                Point3f first_C = mesh_rebuild1.Vertices[meshface_first.C];//第1个三角face的C点
+                Point3f second_A = mesh_rebuild1.Vertices[meshface_second.A];//第2个三角face的A点
+                Point3f second_B = mesh_rebuild1.Vertices[meshface_second.B];//第2个三角face的B点
+                Point3f second_C = mesh_rebuild1.Vertices[meshface_second.C];//第2个三角face的C点
+
+                List<Point3f> pt_o = new List<Point3f>(){first_A, first_B, first_C, second_A, second_B, second_C}.Distinct().ToList();//将上述点去重后成组
+                int count = pt_o.Count;
+                List<Point3f> pt_x = pt_o.OrderBy(p => p.X).ToList();//4个点根据X值排序
+                List<Point3f> pt_14 = new List<Point3f>(){pt_x[0], pt_x[1]}.OrderBy(p =>p.Y).ToList();//1与4排序
+                List<Point3f> pt_23 = new List<Point3f>(){pt_x[2], pt_x[3]}.OrderBy(p =>p.Y).ToList();//2与3排序
+                List<Point3f> pt_new = new List<Point3f>(){pt_14[0], pt_23[0],pt_23[1], pt_14[1]};//新的quad face的点排序
+
+                Mesh m_temp = new Mesh();
+                m_temp.Faces.AddFace(0,1,2,3);//新增一个face
+                m_temp.Vertices.AddVertices(pt_new);//face增加新节点
+                quad_mesh.Append(m_temp);
+                quad_mesh1 = quad_mesh.DuplicateMesh();
+            }
+
+            mesh_rebuild1.Faces.DeleteFaces(face_ID);//删除筛选出的tri faces
+            mesh_rebuild1.Append(quad_mesh1);//增加上重生成的quad mesh
+            mesh_rebuild1 = FlipMeshToUp(mesh_rebuild1);//函数：将mesh的正面转到向上
+        }
+
+        Transform to_o = Transform.PlaneToPlane( Plane.WorldXY, new Plane(center_o_mesh, corner1_o_mesh, corner2_o_mesh));//移动到原来位置变形量
+        mesh_rebuild1.Transform(to_o);//将重生成的mesh移动到原来位置
+        mesh_rebuild1.HealNakedEdges(1);//修复重复边
+        mesh_rebuild1.Weld(Math.PI);//焊接边
+
+        New_Mesh = mesh_rebuild1;
+    }
+
+    public Mesh FlipMeshToUp(Mesh mesh0){// 将mesh的正面转到向上
+        mesh0.Normals.ComputeNormals();//重新计算法线
+        Vector3f mvn_vector = mesh0.Normals[0];
+
+        if(mvn_vector.Z < 0){//如果法线的Z为负，则反转mesh
+            mesh0.Flip(true, true, true);
+        }
+        
+        Mesh mesh1 = mesh0.DuplicateMesh();
+        return mesh1;
+    }
+}
+
