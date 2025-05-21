@@ -1,0 +1,78 @@
+import rhinoscriptsyntax as rs
+import Rhino.Geometry as rg
+import ghpythonlib.treehelpers as th
+
+# 输入参数
+surfaces = s  # 输入的面列表
+N = n  # 横向分割数
+M = m  # 竖向分割数
+
+# 计算所有面的总边界框
+all_bbox = None
+for s in surfaces:
+    bbox = s.GetBoundingBox(True)
+
+    if all_bbox is None:
+        all_bbox = bbox
+    else:
+        all_bbox.Union(bbox)
+
+# 获取边界框的角点
+min_point = all_bbox.Min
+max_point = all_bbox.Max
+
+# 计算分割步长
+x_step = (max_point.X - min_point.X) / N
+y_step = (max_point.Y - min_point.Y) / M
+
+# 创建区域列表
+regions = []
+for i in range(N):
+    for j in range(M):
+        # 计算区域的角点
+        x_min = min_point.X + i * x_step
+        x_max = min_point.X + (i + 1) * x_step
+        y_min = min_point.Y + j * y_step
+        y_max = min_point.Y + (j + 1) * y_step
+        
+        # 创建区域边界框
+        region_box = rg.BoundingBox(
+            rg.Point3d(x_min, y_min, min_point.Z),
+            rg.Point3d(x_max, y_max, max_point.Z)
+        )
+        regions.append(region_box)
+
+# 初始化每个区域的面列表
+region_surfaces = [[] for _ in range(N * M)]
+
+points = []
+for s in surfaces:
+    # 计算面的重心
+    area_props = rs.SurfaceAreaCentroid(s)
+    points.append(area_props[0])
+
+# 将面分配到各个区域
+for s in surfaces:
+    # 计算面的重心
+    area_props = rs.SurfaceAreaCentroid(s)
+    centroid = area_props[0]
+    
+    # 检查重心位于哪个区域
+    for idx, region in enumerate(regions):
+        # 创建区域的2D边界
+        region_rect = rg.Rectangle3d(
+            rg.Plane.WorldXY,
+            rg.Point3d(region.Min.X, region.Min.Y, 0),
+            rg.Point3d(region.Max.X, region.Max.Y, 0)
+        )
+        
+        containment = region_rect.Contains(centroid.X,centroid.Y )
+        if containment == rg.PointContainment.Inside:
+            region_surfaces[idx].append(s)
+            break  # 确保一个面只属于一个区域
+
+# 输出结果 将list list 转换为tree
+region_surfaces_tree = th.list_to_tree(region_surfaces)
+
+# 输出结果
+a = region_surfaces_tree
