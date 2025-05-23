@@ -1,3 +1,7 @@
+#BUG: 现版本PYTHON SCRIPT 无法导出BOUNDINGBOX
+#教训： 下次再导不出东西，直接print看下out接口，别傻乎乎来回试不同的method!
+
+
 import rhinoscriptsyntax as rs
 import Rhino.Geometry as rg
 import ghpythonlib.treehelpers as th
