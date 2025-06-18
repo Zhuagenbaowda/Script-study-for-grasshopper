@@ -1,0 +1,46 @@
+import System
+from System.Collections.Generic import List
+import Rhino
+import Grasshopper as gh
+from Grasshopper.Kernel.Data import GH_Path
+from Grasshopper import DataTree
+import Rhino.Geometry as rg
+import ghpythonlib.treehelpers as gt
+
+def match_curves_points(Curves, Points):
+    matched_pairs = []  
+    
+    for curve in Curves:
+        if not curve.IsClosed:  # 以防万一，保证曲线封闭
+            continue
+            
+        matched_point = None
+        for pt in Points:
+            containment = curve.Contains(pt)
+            # 点是否在曲线内部或边界
+            if containment in (rg.PointContainment.Inside, rg.PointContainment.Coincident):
+                matched_point = pt
+                break  # 找到即停止，默认只有一个
+        
+        if matched_point:
+            # 记录匹配对并从原始list中移除该点
+            matched_pairs.append([curve, matched_point])
+            Points.remove(matched_point) 
+    
+    return matched_pairs, Points
+
+def create_data_tree(pairs):
+    """将匹配对转换为Grasshopper树结构"""
+    tree = DataTree[object]()
+    for idx, (curve, point) in enumerate(pairs):
+        path = GH_Path(idx)
+        tree.Add(curve, path)
+        tree.Add(point, path)
+    return tree
+
+
+if __name__ == "__main__":
+    matched_pairs, remaining_points = match_curves_points(Curves, Points)
+    result_tree = create_data_tree(matched_pairs)
+    out_tree = result_tree   
+    out_remaining = remaining_points
